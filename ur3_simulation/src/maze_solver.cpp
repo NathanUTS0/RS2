@@ -13,9 +13,18 @@ cv::Mat scaleImageToFit(const cv::Mat& src, int maxWidth, int maxHeight) {
     double scaleX = (double)maxWidth / src.cols;
     double scaleY = (double)maxHeight / src.rows;
     double scale = std::min(scaleX, scaleY);
+    
     cv::Mat resized;
     cv::resize(src, resized, cv::Size(), scale, scale, cv::INTER_AREA);
-    return resized;
+
+    // Increase contrast using cv::convertScaleAbs()
+    double alpha = 0.5;  // Contrast factor (<1 increases contrast)
+    double beta =5;    // Brightness factor (>0 increases brightness)
+    
+    cv::Mat contrastEnhanced;
+    resized.convertTo(contrastEnhanced, -1, alpha, beta);
+
+    return contrastEnhanced;
 }
 
 //////// Detect red dots and return their coordinates
@@ -104,13 +113,14 @@ std::vector<cv::Point> findShortestPath(cv::Mat& maze, cv::Point start, cv::Poin
     std::vector<cv::Point> turnPoints;
     turnPoints.push_back(start);
 
-  
-    double angleThreshold = 0.6; // Adjust this value to tweak sensitivity
+    double angleThreshold = 0.5; // Adjust this value to tweak sensitivity
+    int minPointDistance = 10; // Minimum distance between turn points
+    int turnRadius = 3; // radius check for turn consistency
 
-    for (size_t i = 1; i < path.size() - 1; ++i) {
-        cv::Point prev = path[i - 1];
+    for (size_t i = turnRadius; i < path.size() - turnRadius - 1; ++i) {
+        cv::Point prev = path[i - turnRadius];
         cv::Point curr = path[i];
-        cv::Point next = path[i + 1];
+        cv::Point next = path[i + turnRadius];
 
         double angle1 = std::atan2(curr.y - prev.y, curr.x - prev.x);
         double angle2 = std::atan2(next.y - curr.y, next.x - curr.x);
@@ -118,7 +128,17 @@ std::vector<cv::Point> findShortestPath(cv::Mat& maze, cv::Point start, cv::Poin
         if (angleDiff > M_PI) angleDiff = 2 * M_PI - angleDiff;
 
         if (angleDiff > angleThreshold) {
-            turnPoints.push_back(curr);
+            bool addPoint = true;
+            for (const auto& existingPoint : turnPoints) {
+                double distance = std::sqrt(std::pow(curr.x - existingPoint.x, 2) + std::pow(curr.y - existingPoint.y, 2));
+                if (distance < minPointDistance) {
+                    addPoint = false;
+                    break;
+                }
+            }
+            if (addPoint) {
+                turnPoints.push_back(curr);
+            }
         }
     }
 
@@ -143,52 +163,95 @@ std::vector<cv::Point> findShortestPath(cv::Mat& maze, cv::Point start, cv::Poin
     return path;
 }
 
-//////// doesn't work yet
+//////// detects corners of the maze boundry 
 std::vector<cv::Point> detectMazeBoundingBoxCorners(const cv::Mat& binaryImage, cv::Mat& imageToDrawOn) {
     std::vector<cv::Point> corners;
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(binaryImage, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    // Invert the binary image to find black contours
+    cv::Mat invertedBinary;
+    cv::bitwise_not(binaryImage, invertedBinary);
+
+    // Find contours
+    cv::findContours(invertedBinary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     if (contours.empty()) {
         std::cerr << "Error: No contours found." << std::endl;
         return corners;
     }
 
-    // Find the largest contour (assuming it's the maze)
+    // Find the largest contour by area
     double maxArea = 0;
-    int maxAreaContourIndex = 0;
-    for (size_t i = 0; i < contours.size(); ++i) {
-        double area = cv::contourArea(contours[i]);
+    std::vector<cv::Point> bestContour;
+    
+    for (const auto& contour : contours) {
+        double area = cv::contourArea(contour);
         if (area > maxArea) {
             maxArea = area;
-            maxAreaContourIndex = i;
+            bestContour = contour;
         }
     }
 
-    // Approximate the contour to a polygon
-    std::vector<cv::Point> approxCurve;
-    double epsilon = 0.04 * cv::arcLength(contours[maxAreaContourIndex], true);
-    cv::approxPolyDP(contours[maxAreaContourIndex], approxCurve, epsilon, true);
+    if (bestContour.empty()) {
+        std::cerr << "Error: No valid maze contour found." << std::endl;
+        return corners;
+    }
 
-    // Check if the polygon has 4 corners (a square)
+    // Approximate the contour with a polygon
+    std::vector<cv::Point> approxCurve;
+    double epsilon = 0.02 * cv::arcLength(bestContour, true); // Adjust epsilon for accuracy
+    cv::approxPolyDP(bestContour, approxCurve, epsilon, true);
+
+    // Ensure we have exactly 4 corners
     if (approxCurve.size() == 4) {
         corners = approxCurve;
-
-        // Draw corners on the image
-        for (const auto& corner : corners) {
-            cv::circle(imageToDrawOn, corner, 5, cv::Scalar(255, 0, 0), -1);
-        }
-
-        // Print corner coordinates
-        std::cout << "Detected Square Corners:" << std::endl;
-        for (size_t i = 0; i < corners.size(); ++i) {
-            std::cout << "Corner " << i + 1 << ": (" << corners[i].x << ", " << corners[i].y << ")" << std::endl;
-        }
     } else {
-        std::cerr << "Error: Could not find a square (4 corners)." << std::endl;
+        std::cerr << "Warning: Found " << approxCurve.size() << " corners instead of 4." << std::endl;
+        // If we don't have 4 corners, we can still use the bounding box corners as a fallback
+        cv::Rect boundingBox = cv::boundingRect(bestContour);
+        corners.push_back(boundingBox.tl());
+        corners.push_back(cv::Point(boundingBox.x + boundingBox.width, boundingBox.y));
+        corners.push_back(cv::Point(boundingBox.x, boundingBox.y + boundingBox.height));
+        corners.push_back(boundingBox.br());
+    }
+
+    // Draw blue dots on the corners
+    for (const auto& corner : corners) {
+        cv::circle(imageToDrawOn, corner, 5, cv::Scalar(255, 0, 0), -1);
+    }
+
+    // Print detected corners
+    std::cout << "Detected Maze Corners:" << std::endl;
+    for (size_t i = 0; i < corners.size(); ++i) {
+        std::cout << "Corner " << i + 1 << ": (" << corners[i].x << ", " << corners[i].y << ")" << std::endl;
     }
 
     return corners;
+}
+
+////////calculates distances in mm between each point
+std::vector<std::pair<double, double>> calculateRealWorldDistances(const std::vector<cv::Point>& turnPoints, const std::vector<cv::Point>& corners) {
+    std::vector<std::pair<double, double>> distances;
+
+    if (corners.size() != 4 || turnPoints.size() < 2) {
+        std::cerr << "Error: Invalid corners or turn points." << std::endl;
+        return distances;
+    }
+
+    // Calculate pixel distance between two corners (e.g., top-left and top-right)
+    double pixelDistance = std::sqrt(std::pow(corners[1].x - corners[0].x, 2) + std::pow(corners[1].y - corners[0].y, 2));
+
+    // Calculate pixel to mm ratio
+    double mmPerPixel = 200.0 / pixelDistance; // 200mm is the real-world size
+
+    // Calculate real-world distances between turn points
+    for (size_t i = 1; i < turnPoints.size(); ++i) {
+        double dx = (turnPoints[i].x - turnPoints[i - 1].x) * mmPerPixel;
+        double dy = (turnPoints[i].y - turnPoints[i - 1].y) * mmPerPixel;
+        distances.emplace_back(dx, dy);
+    }
+
+    return distances;
 }
 
 int main() {
@@ -249,27 +312,37 @@ int main() {
     }
 
     std::string outputFile = "turn_points.txt";
-    std::vector<cv::Point> path = findShortestPath(skel, start, end, radius, outputFile);
+    std::vector<cv::Point> path = findShortestPath(skel, start, end, radius, outputFile); //change this for different algorithm
 
     // Draw start and end points in red
     cv::circle(maze, start, 5, cv::Scalar(0, 0, 255), -1);
     cv::circle(maze, end, 5, cv::Scalar(0, 0, 255), -1);
 
-   // Detect corners and draw them on the maze image
-   detectMazeBoundingBoxCorners(binary, maze); // Pass binary and maze
+    // Detect corners and draw them on the maze image
+    std::vector<cv::Point> corners = detectMazeBoundingBoxCorners(binary, maze);
 
     // Draw turn points in green
     std::ifstream inFile(outputFile);
+    std::vector<cv::Point> turnPoints; // Store turn points
     if (inFile.is_open()) {
         int x, y;
         while (inFile >> x >> y) {
             cv::circle(maze, cv::Point(x, y), 3, cv::Scalar(0, 255, 0), -1);
+            turnPoints.emplace_back(x, y); // Populate turnPoints vector
         }
         inFile.close();
     } else {
         std::cerr << "Error: Could not open file " << outputFile << std::endl;
     }
 
+    // Calculate real-world distances between turn points
+    std::vector<std::pair<double, double>> realWorldDistances = calculateRealWorldDistances(turnPoints, corners);
+
+    // Print real-world distances
+    std::cout << "Real World Distances (mm):" << std::endl;
+    for (const auto& distance : realWorldDistances) {
+        std::cout << "dx: " << distance.first << ", dy: " << distance.second << std::endl;
+    }
     // Create an inverted copy for display
     cv::Mat invertedSkel;
     cv::bitwise_not(skel.clone(), invertedSkel);
